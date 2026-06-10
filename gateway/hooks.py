@@ -8,6 +8,7 @@ Hooks are discovered from ~/.hermes/hooks/ directories, each containing:
 
 Events:
   - gateway:startup     -- Gateway process starts
+  - gateway:message:preprocess -- Decision hook before session/agent dispatch
   - session:start       -- New session created (first message of a new session)
   - session:end         -- Session ends (user ran /new or /reset)
   - session:reset       -- Session reset completed (new session entry created)
@@ -34,6 +35,16 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
 Handlers posting a follow-up into the same Telegram forum-topic should
 include ``message_thread_id=int(thread_id)`` when ``chat_type == "forum"``
 and ``thread_id`` is non-empty.
+
+``gateway:message:preprocess`` is a decision-style hook. Handlers may return:
+  {"action": "allow"}
+  {"action": "ignore", "reason": "..."}
+  {"action": "rewrite", "message": "..."}
+
+Resolution order when multiple hooks return decisions:
+  1. any ``ignore`` wins
+  2. else last ``rewrite`` wins
+  3. else default ``allow``
 """
 
 import asyncio
@@ -47,6 +58,43 @@ from hermes_cli.config import get_hermes_home
 
 
 HOOKS_DIR = get_hermes_home() / "hooks"
+
+
+def _normalize_preprocess_hook_result(result: Any) -> Optional[Dict[str, Any]]:
+    """Normalize a preprocess hook return shape into a canonical dict."""
+    if not isinstance(result, dict):
+        return None
+    action = str(result.get("action", "")).strip().lower()
+    if action not in {"allow", "ignore", "rewrite"}:
+        return None
+    normalized: Dict[str, Any] = {"action": action}
+    if action == "ignore":
+        reason = result.get("reason")
+        if reason is not None:
+            normalized["reason"] = str(reason)
+    elif action == "rewrite":
+        message = result.get("message")
+        if not isinstance(message, str) or not message:
+            return None
+        normalized["message"] = message
+    return normalized
+
+
+def resolve_message_preprocess_results(results: List[Any]) -> Dict[str, Any]:
+    """Resolve collected preprocess hook results into a single decision."""
+    last_rewrite: Optional[Dict[str, Any]] = None
+    for raw in results:
+        decision = _normalize_preprocess_hook_result(raw)
+        if not decision:
+            continue
+        action = decision["action"]
+        if action == "ignore":
+            return decision
+        if action == "rewrite":
+            last_rewrite = decision
+    if last_rewrite is not None:
+        return last_rewrite
+    return {"action": "allow"}
 
 
 class HookRegistry:

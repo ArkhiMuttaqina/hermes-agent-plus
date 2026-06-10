@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from gateway.hooks import HookRegistry
+from gateway.hooks import HookRegistry, resolve_message_preprocess_results
 
 
 def _create_hook(hooks_dir, hook_name, events, handler_code):
@@ -314,3 +314,29 @@ class TestEmitCollect:
         await reg.emit_collect("agent:start")  # no context arg
 
         assert captured == [("agent:start", {})]
+
+
+class TestPreprocessResolution:
+    def test_preprocess_defaults_to_allow(self):
+        assert resolve_message_preprocess_results([]) == {"action": "allow"}
+
+    def test_preprocess_ignores_invalid_shapes(self):
+        assert resolve_message_preprocess_results([
+            None,
+            "bad",
+            {"action": "unknown"},
+            {"action": "rewrite"},
+        ]) == {"action": "allow"}
+
+    def test_preprocess_ignore_beats_rewrite(self):
+        assert resolve_message_preprocess_results([
+            {"action": "rewrite", "message": "patched"},
+            {"action": "ignore", "reason": "bot-origin"},
+        ]) == {"action": "ignore", "reason": "bot-origin"}
+
+    def test_preprocess_last_rewrite_wins(self):
+        assert resolve_message_preprocess_results([
+            {"action": "rewrite", "message": "first"},
+            {"action": "allow"},
+            {"action": "rewrite", "message": "second"},
+        ]) == {"action": "rewrite", "message": "second"}

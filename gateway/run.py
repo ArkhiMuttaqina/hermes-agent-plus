@@ -53,6 +53,7 @@ from typing import Dict, Optional, Any, List, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
+from gateway.hooks import resolve_message_preprocess_results
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -2157,6 +2158,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
 
+
+    async def run_message_preprocess_hooks(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Run decision-style preprocess hooks before session / agent dispatch."""
+        try:
+            hook_results = await self.hooks.emit_collect(
+                "gateway:message:preprocess",
+                context,
+            )
+        except Exception as exc:
+            logger.debug("gateway:message:preprocess hook dispatch failed (non-fatal): %s", exc)
+            return {"action": "allow"}
+        return resolve_message_preprocess_results(hook_results)
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.

@@ -17,6 +17,7 @@ import html as _html
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
+from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 
@@ -5278,6 +5279,54 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    def _telegram_message_from_bot(self, message: Message) -> tuple[bool, Optional[str]]:
+        """Return whether the sender is a bot and its username when available."""
+        user = getattr(message, "from_user", None)
+        if user is None:
+            sender_chat = getattr(message, "sender_chat", None)
+            username = getattr(sender_chat, "username", None) if sender_chat is not None else None
+            is_bot = bool(sender_chat is not None)
+            return is_bot, (str(username) if username else None)
+        username = getattr(user, "username", None)
+        return bool(getattr(user, "is_bot", False)), (str(username) if username else None)
+
+    def _telegram_preprocess_context(self, event: MessageEvent, message: Message, *, is_command: bool = False) -> Dict[str, Any]:
+        """Build normalized hook context for gateway:message:preprocess."""
+        from_user_is_bot, from_bot_username = self._telegram_message_from_bot(message)
+        source = event.source
+        return {
+            "platform": "telegram",
+            "profile": os.getenv("HERMES_PROFILE", "default") or "default",
+            "chat_type": getattr(source, "chat_type", "") or "",
+            "chat_id": getattr(source, "chat_id", "") or "",
+            "thread_id": str(getattr(source, "thread_id", None)) if getattr(source, "thread_id", None) else "",
+            "message": event.text or "",
+            "bot_username": getattr(getattr(self, "_bot", None), "username", None) or "",
+            "is_mentioned": self._message_mentions_bot(message),
+            "is_reply_to_bot": self._is_reply_to_bot(message),
+            "is_command": bool(is_command),
+            "from_user_id": getattr(source, "user_id", "") or "",
+            "from_user_is_bot": from_user_is_bot,
+            "from_bot_username": from_bot_username,
+        }
+
+    async def _apply_preprocess_hook(self, event: MessageEvent, message: Message, *, is_command: bool = False) -> Optional[MessageEvent]:
+        """Run gateway preprocess hooks and mutate / drop the event as directed."""
+        handler = getattr(self, "_message_handler", None)
+        runner = getattr(handler, "__self__", None) if handler else None
+        hook_runner = getattr(runner, "run_message_preprocess_hooks", None)
+        if hook_runner is None:
+            return event
+        decision = await hook_runner(self._telegram_preprocess_context(event, message, is_command=is_command))
+        action = str((decision or {}).get("action", "allow")).strip().lower()
+        if action == "ignore":
+            return None
+        if action == "rewrite":
+            new_message = str((decision or {}).get("message", ""))
+            if new_message:
+                event.text = new_message
+        return event
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -5297,6 +5346,9 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
+        event = await self._apply_preprocess_hook(event, msg)
+        if event is None:
+            return
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5311,6 +5363,9 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
+        event = await self._apply_preprocess_hook(event, msg, is_command=True)
+        if event is None:
+            return
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5351,6 +5406,9 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
+        event = await self._apply_preprocess_hook(event, msg)
+        if event is None:
+            return
         await self.handle_message(event)
 
     # ------------------------------------------------------------------
@@ -5522,6 +5580,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Add caption as text
         if msg.caption:
             event.text = self._clean_bot_trigger_text(msg.caption)
+        
+        event = await self._apply_preprocess_hook(event, msg)
+        if event is None:
+            return
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:

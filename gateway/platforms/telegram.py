@@ -15,6 +15,7 @@ import os
 import tempfile
 import html as _html
 import re
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 from types import SimpleNamespace
@@ -441,6 +442,9 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._bot_turn_state: Dict[str, Dict[str, Any]] = {}
+        self._bot_call_state_path = _Path.home() / '.hermes' / 'telegram_bot_calls.json'
+        self._pending_bot_call_retry_tasks: Dict[str, asyncio.Task] = {}
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
@@ -2084,6 +2088,22 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                         raise
                 message_ids.append(str(msg.message_id))
+
+                try:
+                    skip_tracking = bool(metadata and metadata.get("telegram_skip_bot_call_tracking"))
+                    is_group_target = str(chat_id).startswith("-")
+                    if not skip_tracking and is_group_target and i == 0 and msg is not None:
+                        targets = [
+                            handle for handle in self._extract_bot_mentions_from_text(content)
+                            if handle != self._protocol_bot_name()
+                        ]
+                        for target in targets[:1]:
+                            protocol_id = self._register_outgoing_bot_call(str(chat_id), str(msg.message_id), target, content)
+                            tasks = getattr(self, "_pending_bot_call_retry_tasks", None)
+                            if isinstance(tasks, dict) and protocol_id not in tasks:
+                                tasks[protocol_id] = asyncio.create_task(self._retry_bot_call_if_unacked(protocol_id))
+                except Exception:
+                    logger.debug("[Telegram] failed to register outgoing bot call tracking", exc_info=True)
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -4378,10 +4398,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_thread_id=message_thread_id,
                 )
             except Exception as e:
-                # For DM topic lanes, Telegram may reject message_thread_id.
-                # Fall back to sending typing without thread_id so the typing
-                # indicator at least appears in the main DM view.
-                if _is_dm_topic and message_thread_id is not None:
+                # Telegram can reject message_thread_id for some DM/group topic
+                # combinations. Fall back to typing without thread_id so the
+                # indicator still appears somewhere instead of vanishing.
+                if message_thread_id is not None:
                     try:
                         await self._bot.send_chat_action(
                             chat_id=int(chat_id),
@@ -5216,6 +5236,97 @@ class TelegramAdapter(BasePlatformAdapter):
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
+        sender_is_bot, sender_bot_username = self._telegram_message_from_bot(message)
+        message_text = (getattr(message, "text", None) or getattr(message, "caption", None) or "")
+        bot_explicit_trigger = False
+        if sender_is_bot:
+            normalized_sender_bot = str(sender_bot_username or "").strip().lstrip("@").lower()
+            allowed_bot_senders = {
+                "haku_neko_bot",
+                "mas_murdock_bot",
+                "devans1_bot",
+                "devins2_bot",
+                "qoala1_bot",
+                "qoala2_bot",
+            }
+            noisy_bot_markers = (
+                "⚡ Interrupting current task",
+                "Operation interrupted:",
+                "gpt-",
+                "⏳ Agent is running",
+                "📚 skill_view:",
+                "📖 read_file:",
+                "🔎 search_files:",
+                "🔧 patch",
+                "📋 todo:",
+            )
+            cleaned_bot_lines = []
+            stripped_noise = False
+            for _line in str(message_text).splitlines():
+                _trimmed = _line.strip()
+                if _trimmed and any(marker in _trimmed for marker in noisy_bot_markers):
+                    stripped_noise = True
+                    continue
+                cleaned_bot_lines.append(_line)
+            cleaned_bot_text = "\n".join(cleaned_bot_lines).strip()
+            if not cleaned_bot_text and stripped_noise:
+                logger.info(
+                    "[Telegram] ignoring noisy bot-origin group message bot=%s sender_bot=%s chat=%s text=%r",
+                    getattr(getattr(self, "_bot", None), "username", None),
+                    sender_bot_username,
+                    chat_id_str,
+                    (message_text[:200]),
+                )
+                return False
+            if normalized_sender_bot not in allowed_bot_senders:
+                logger.info(
+                    "[Telegram] ignoring unauthorized bot-origin group message bot=%s sender_bot=%s chat=%s text=%r",
+                    getattr(getattr(self, "_bot", None), "username", None),
+                    sender_bot_username,
+                    chat_id_str,
+                    (message_text[:200]),
+                )
+                return False
+            explicit_trigger = self._message_mentions_bot(message) or self._is_reply_to_bot(message)
+            concise_bot_prompt = len((cleaned_bot_text or message_text).strip()) <= 600
+            if explicit_trigger and concise_bot_prompt:
+                bot_explicit_trigger = True
+                if stripped_noise:
+                    logger.info(
+                        "[Telegram] allowing bot-origin explicit trigger after stripping noisy footer bot=%s sender_bot=%s chat=%s text=%r cleaned=%r",
+                        getattr(getattr(self, "_bot", None), "username", None),
+                        sender_bot_username,
+                        chat_id_str,
+                        (message_text[:200]),
+                        (cleaned_bot_text[:200]),
+                    )
+                else:
+                    logger.info(
+                        "[Telegram] allowing bot-origin explicit trigger bot=%s sender_bot=%s chat=%s text=%r",
+                        getattr(getattr(self, "_bot", None), "username", None),
+                        sender_bot_username,
+                        chat_id_str,
+                        (message_text[:200]),
+                    )
+            elif explicit_trigger:
+                logger.info(
+                    "[Telegram] ignoring verbose bot-origin explicit trigger bot=%s sender_bot=%s chat=%s text=%r",
+                    getattr(getattr(self, "_bot", None), "username", None),
+                    sender_bot_username,
+                    chat_id_str,
+                    (message_text[:200]),
+                )
+                return False
+            else:
+                logger.info(
+                    "[Telegram] ignoring bot-origin group message bot=%s sender_bot=%s chat=%s text=%r",
+                    getattr(getattr(self, "_bot", None), "username", None),
+                    sender_bot_username,
+                    chat_id_str,
+                    (message_text[:200]),
+                )
+                return False
+
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
 
@@ -5327,6 +5438,235 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.text = new_message
         return event
 
+    def _bot_turn_key_for_message(self, message: Any) -> str:
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "")
+        thread_id = getattr(message, "message_thread_id", None)
+        is_forum_group = getattr(getattr(message, "chat", None), "is_forum", False) is True
+        if thread_id is None and self._is_group_chat(message) and is_forum_group:
+            thread_id = self._GENERAL_TOPIC_THREAD_ID
+        return f"{chat_id}:{thread_id or 'root'}"
+
+    def _parse_bot_turn_protocol(self, text: str) -> Optional[Dict[str, str]]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        m = re.search(r"\[(BOT_CALL|BOT_REPLY)\s+id=([^\s\]]+)\s+to=([^\s\]]+)\s+from=([^\s\]]+)\]", raw, re.IGNORECASE)
+        if m:
+            kind, msg_id, to_name, from_name = m.groups()
+            return {
+                "kind": kind.upper(),
+                "id": msg_id.strip(),
+                "to": to_name.strip().lstrip("@").lower(),
+                "from": from_name.strip().lstrip("@").lower(),
+            }
+        m = re.search(r"\[(call|reply):([^\]\s]+)\]", raw, re.IGNORECASE)
+        if m:
+            kind, msg_id = m.groups()
+            return {
+                "kind": f"BOT_{kind.upper()}",
+                "id": msg_id.strip(),
+                "to": "",
+                "from": "",
+            }
+        return None
+
+    def _protocol_bot_name(self) -> str:
+        return str(getattr(getattr(self, "_bot", None), "username", None) or "").strip().lstrip("@").lower()
+
+    def _extract_bot_mentions_from_text(self, text: str) -> list[str]:
+        handles: list[str] = []
+        for match in re.finditer(r"(?i)(?<![A-Za-z0-9_`/])@([A-Za-z0-9_]{2,29}bot)\b", str(text or "")):
+            handle = match.group(1).lower()
+            if handle not in handles:
+                handles.append(handle)
+        return handles
+
+    def _load_bot_call_state(self) -> dict[str, Any]:
+        path = getattr(self, "_bot_call_state_path", None)
+        if path is None:
+            return {}
+        try:
+            if not path.exists():
+                return {}
+            raw = json.loads(path.read_text())
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_bot_call_state(self, state: dict[str, Any]) -> None:
+        path = getattr(self, "_bot_call_state_path", None)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
+        except Exception:
+            logger.debug("[Telegram] failed to persist bot call state", exc_info=True)
+
+    def _register_outgoing_bot_call(self, chat_id: str, message_id: str, target_bot: str, content: str) -> str:
+        protocol_id = f"auto-{chat_id}-{message_id}"
+        state = self._load_bot_call_state()
+        calls = state.setdefault("calls", {})
+        calls[protocol_id] = {
+            "chat_id": str(chat_id),
+            "message_id": str(message_id),
+            "target_bot": str(target_bot).strip().lstrip("@").lower(),
+            "source_bot": self._protocol_bot_name(),
+            "content": str(content or ""),
+            "acked_by": [],
+            "retry_count": 0,
+            "created_at": time.time(),
+        }
+        self._save_bot_call_state(state)
+        return protocol_id
+
+    def _ack_bot_call(self, protocol_id: str, bot_name: str) -> None:
+        if not protocol_id:
+            return
+        state = self._load_bot_call_state()
+        calls = state.get("calls") or {}
+        entry = calls.get(protocol_id)
+        if not isinstance(entry, dict):
+            return
+        acked_by = entry.setdefault("acked_by", [])
+        bot_name = str(bot_name or "").strip().lstrip("@").lower()
+        if bot_name and bot_name not in acked_by:
+            acked_by.append(bot_name)
+            entry["acked_at"] = time.time()
+            self._save_bot_call_state(state)
+
+    async def _retry_bot_call_if_unacked(self, protocol_id: str) -> None:
+        try:
+            await asyncio.sleep(12)
+            state = self._load_bot_call_state()
+            calls = state.get("calls") or {}
+            entry = calls.get(protocol_id)
+            if not isinstance(entry, dict):
+                return
+            target_bot = str(entry.get("target_bot") or "").strip().lstrip("@").lower()
+            if not target_bot:
+                return
+            if target_bot in set(str(x).strip().lstrip("@").lower() for x in (entry.get("acked_by") or [])):
+                return
+            retry_count = int(entry.get("retry_count") or 0)
+            if retry_count >= 1:
+                return
+            retry_text = str(entry.get("content") or "").strip()
+            if not retry_text:
+                return
+            entry["retry_count"] = retry_count + 1
+            self._save_bot_call_state(state)
+            logger.info(
+                "[Telegram] retrying unacked bot call protocol_id=%s target_bot=%s source_bot=%s",
+                protocol_id,
+                target_bot,
+                self._protocol_bot_name(),
+            )
+            await self.send(
+                str(entry.get("chat_id") or ""),
+                retry_text,
+                reply_to=str(entry.get("message_id") or "") or None,
+                metadata={"telegram_skip_bot_call_tracking": True},
+            )
+        except Exception:
+            logger.debug("[Telegram] bot call retry task failed", exc_info=True)
+        finally:
+            tasks = getattr(self, "_pending_bot_call_retry_tasks", None)
+            if isinstance(tasks, dict):
+                tasks.pop(protocol_id, None)
+
+    def _synthesize_bot_turn_protocol(self, message: Any) -> Optional[Dict[str, str]]:
+        sender_is_bot, sender_bot_username = self._telegram_message_from_bot(message)
+        if not sender_is_bot:
+            return None
+        sender_bot = str(sender_bot_username or "").strip().lstrip("@").lower()
+        if not sender_bot:
+            return None
+        text = str(getattr(message, "text", None) or "").strip()
+        if not text or len(text) > 600:
+            return None
+        bot_name = self._protocol_bot_name()
+        synthetic_id = f"auto-{getattr(getattr(message, 'chat', None), 'id', 'chat')}-{getattr(message, 'message_id', 'msg')}"
+        if self._message_mentions_bot(message):
+            return {
+                "kind": "BOT_CALL",
+                "id": synthetic_id,
+                "to": bot_name,
+                "from": sender_bot,
+            }
+        if self._is_reply_to_bot(message):
+            return {
+                "kind": "BOT_REPLY",
+                "id": synthetic_id,
+                "to": bot_name,
+                "from": sender_bot,
+            }
+        return None
+
+    def _should_accept_bot_turn(self, message: Any, protocol: Dict[str, str]) -> bool:
+        sender_is_bot, sender_bot_username = self._telegram_message_from_bot(message)
+        if not sender_is_bot:
+            return True
+        bot_name = self._protocol_bot_name()
+        if protocol.get("to") and protocol.get("to") != bot_name:
+            return False
+        turn_key = self._bot_turn_key_for_message(message)
+        state = self._bot_turn_state.get(turn_key) or {}
+        now = time.monotonic()
+        active_until = float(state.get("active_until", 0.0) or 0.0)
+        active_speaker = str(state.get("active_speaker") or "").strip().lower()
+        waiting_for = str(state.get("waiting_for") or "").strip().lower()
+        sender_bot = str(sender_bot_username or "").strip().lstrip("@").lower()
+        proto_id = str(protocol.get("id") or "").strip()
+        proto_kind = str(protocol.get("kind") or "").strip().upper()
+        if proto_kind == "BOT_CALL":
+            if active_until > now and active_speaker and active_speaker != sender_bot:
+                logger.info(
+                    "[Telegram] bot turn lock rejecting call bot=%s sender_bot=%s active_speaker=%s turn_key=%s protocol_id=%s",
+                    bot_name,
+                    sender_bot,
+                    active_speaker,
+                    turn_key,
+                    proto_id,
+                )
+                return False
+            self._bot_turn_state[turn_key] = {
+                "protocol_id": proto_id,
+                "active_speaker": bot_name,
+                "waiting_for": bot_name,
+                "active_until": now + 45.0,
+                "source_bot": sender_bot,
+            }
+            logger.info(
+                "[Telegram] bot turn accepted call bot=%s sender_bot=%s turn_key=%s protocol_id=%s",
+                bot_name,
+                sender_bot,
+                turn_key,
+                proto_id,
+            )
+            return True
+        if proto_kind == "BOT_REPLY":
+            if waiting_for and waiting_for != sender_bot:
+                logger.info(
+                    "[Telegram] bot turn lock rejecting reply bot=%s sender_bot=%s waiting_for=%s turn_key=%s protocol_id=%s",
+                    bot_name,
+                    sender_bot,
+                    waiting_for,
+                    turn_key,
+                    proto_id,
+                )
+                return False
+            self._bot_turn_state.pop(turn_key, None)
+            logger.info(
+                "[Telegram] bot turn accepted reply bot=%s sender_bot=%s turn_key=%s protocol_id=%s",
+                bot_name,
+                sender_bot,
+                turn_key,
+                proto_id,
+            )
+            return True
+        return False
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -5337,7 +5677,71 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        if not self._should_process_message(msg):
+        should_process = self._should_process_message(msg)
+        protocol = None
+        sender_is_bot, _sender_bot_username = self._telegram_message_from_bot(msg)
+        if self._is_group_chat(msg) and self._reactions_enabled():
+            try:
+                observer_chat_id = getattr(getattr(msg, "chat", None), "id", None)
+                observer_message_id = getattr(msg, "message_id", None)
+                if observer_chat_id and observer_message_id:
+                    reaction = "👀" if (self._message_mentions_bot(msg) or self._is_reply_to_bot(msg)) else "🤔"
+                    await self._set_reaction(str(observer_chat_id), str(observer_message_id), reaction)
+                    logger.info(
+                        "[Telegram] intake reaction bot=%s chat=%s message_id=%s reaction=%s should_process=%s sender_is_bot=%s",
+                        getattr(getattr(self, "_bot", None), "username", None),
+                        observer_chat_id,
+                        observer_message_id,
+                        reaction,
+                        should_process,
+                        sender_is_bot,
+                    )
+            except Exception:
+                logger.debug("[Telegram] intake reaction failed", exc_info=True)
+        if sender_is_bot:
+            protocol = self._parse_bot_turn_protocol(msg.text)
+            synthesized = False
+            if protocol is None:
+                protocol = self._synthesize_bot_turn_protocol(msg)
+                synthesized = protocol is not None
+            if protocol is None:
+                logger.info(
+                    "[Telegram] dropping bot-origin group text without BOT_CALL/BOT_REPLY envelope bot=%s chat=%s text=%r",
+                    getattr(getattr(self, "_bot", None), "username", None),
+                    getattr(getattr(msg, "chat", None), "id", None),
+                    (msg.text or "")[:200],
+                )
+                return
+            if synthesized:
+                logger.info(
+                    "[Telegram] synthesized bot turn protocol bot=%s chat=%s protocol=%s text=%r",
+                    getattr(getattr(self, "_bot", None), "username", None),
+                    getattr(getattr(msg, "chat", None), "id", None),
+                    protocol,
+                    (msg.text or "")[:200],
+                )
+            if not self._should_accept_bot_turn(msg, protocol):
+                return
+            try:
+                self._ack_bot_call(str(protocol.get("id") or ""), self._protocol_bot_name())
+            except Exception:
+                logger.debug("[Telegram] failed to ack bot call", exc_info=True)
+        if self._is_group_chat(msg):
+            try:
+                logger.info(
+                    "[Telegram] inbound text candidate bot=%s chat=%s thread=%s from_user=%s text=%r mentioned=%s reply_to_bot=%s should_process=%s",
+                    getattr(getattr(self, "_bot", None), "username", None),
+                    getattr(getattr(msg, "chat", None), "id", None),
+                    getattr(msg, "message_thread_id", None),
+                    getattr(getattr(msg, "from_user", None), "id", None),
+                    (msg.text or "")[:200],
+                    self._message_mentions_bot(msg),
+                    self._is_reply_to_bot(msg),
+                    should_process,
+                )
+            except Exception:
+                logger.debug("[Telegram] inbound text candidate logging failed", exc_info=True)
+        if not should_process:
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
@@ -5346,9 +5750,43 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
+
+        explicit_group_trigger = self._is_group_chat(msg) and (
+            self._message_mentions_bot(msg)
+            or self._is_reply_to_bot(msg)
+        )
+        if explicit_group_trigger:
+            logger.info(
+                "[Telegram] bypassing preprocess+batching for explicit group trigger bot=%s chat=%s thread=%s from_user=%s text=%r",
+                getattr(getattr(self, "_bot", None), "username", None),
+                getattr(getattr(msg, "chat", None), "id", None),
+                getattr(msg, "message_thread_id", None),
+                getattr(getattr(msg, "from_user", None), "id", None),
+                (event.text or "")[:200],
+            )
+            await self.handle_message(event)
+            return
+
         event = await self._apply_preprocess_hook(event, msg)
         if event is None:
+            logger.info(
+                "[Telegram] preprocess ignored text bot=%s chat=%s thread=%s from_user=%s text=%r",
+                getattr(getattr(self, "_bot", None), "username", None),
+                getattr(getattr(msg, "chat", None), "id", None),
+                getattr(msg, "message_thread_id", None),
+                getattr(getattr(msg, "from_user", None), "id", None),
+                (msg.text or "")[:200],
+            )
             return
+
+        logger.info(
+            "[Telegram] preprocess allowed text bot=%s chat=%s thread=%s from_user=%s text=%r",
+            getattr(getattr(self, "_bot", None), "username", None),
+            getattr(getattr(msg, "chat", None), "id", None),
+            getattr(msg, "message_thread_id", None),
+            getattr(getattr(msg, "from_user", None), "id", None),
+            (event.text or "")[:200],
+        )
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5439,6 +5877,16 @@ class TelegramAdapter(BasePlatformAdapter):
         dispatching the combined message.
         """
         key = self._text_batch_key(event)
+        logger.info(
+            "[Telegram] enqueue text batch key=%s bot=%s chat=%s thread=%s from_user=%s text_len=%s text=%r",
+            key,
+            getattr(getattr(self, "_bot", None), "username", None),
+            getattr(getattr(event, "source", None), "chat_id", None),
+            getattr(getattr(event, "source", None), "thread_id", None),
+            getattr(getattr(event, "source", None), "user_id", None),
+            len(event.text or ""),
+            (event.text or "")[:200],
+        )
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
         if existing is None:
@@ -5458,9 +5906,10 @@ class TelegramAdapter(BasePlatformAdapter):
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():
             prior_task.cancel()
-        self._pending_text_batch_tasks[key] = asyncio.create_task(
-            self._flush_text_batch(key)
-        )
+        task = asyncio.create_task(self._flush_text_batch(key))
+        self._pending_text_batch_tasks[key] = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text.
@@ -5469,6 +5918,7 @@ class TelegramAdapter(BasePlatformAdapter):
         split point, since a continuation chunk is almost certain.
         """
         current_task = asyncio.current_task()
+        logger.info("[Telegram] flush task start key=%s", key)
         try:
             # Adaptive delay tiers:
             #  - last chunk ≥ _SPLIT_THRESHOLD: a continuation is almost
@@ -6213,18 +6663,14 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._set_reaction(chat_id, message_id, "⚡")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Set 👀 for reply/interaction completion and 👁 for passive stop/read state."""
+        """Set ✅ on success, 🤔 on cancel/failure."""
         if not self._reactions_enabled():
             return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if not (chat_id and message_id):
             return
-        if outcome == ProcessingOutcome.CANCELLED:
-            await self._set_reaction(chat_id, message_id, "👁")
+        if outcome == ProcessingOutcome.SUCCESS:
+            await self._set_reaction(chat_id, message_id, "✅")
         else:
-            await self._set_reaction(
-                chat_id,
-                message_id,
-                "👀" if outcome == ProcessingOutcome.SUCCESS else "👁",
-            )
+            await self._set_reaction(chat_id, message_id, "🤔")

@@ -93,7 +93,10 @@ def _reply_anchor_for_event(event) -> str | None:
         # topic seed/anchor can render the bot response outside the active lane.
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "telegram" and thread_id:
-        return None
+        # In forum/group topics, reply to the triggering message as well so the
+        # conversational linkage is visible in-thread instead of looking like an
+        # unrelated standalone post.
+        return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
         return getattr(event, "reply_to_message_id", None)
     return getattr(event, "message_id", None)

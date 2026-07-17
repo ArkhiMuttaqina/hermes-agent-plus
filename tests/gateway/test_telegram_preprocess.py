@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.platforms.telegram import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 class _StubRunner:

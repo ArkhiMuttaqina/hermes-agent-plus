@@ -11,7 +11,7 @@ from gateway.session import SessionSource
 
 
 def _make_adapter(**extra_env):
-    from gateway.platforms.telegram import TelegramAdapter
+    from plugins.platforms.telegram.adapter import TelegramAdapter
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
@@ -126,8 +126,8 @@ async def test_set_reaction_handles_api_error_gracefully(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_on_processing_start_adds_eyes_reaction(monkeypatch):
-    """Processing start should add eyes reaction when enabled."""
+async def test_on_processing_start_adds_active_reaction(monkeypatch):
+    """Processing start should add the fork's active-execution reaction."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event()
@@ -137,7 +137,7 @@ async def test_on_processing_start_adds_eyes_reaction(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction="\U0001f440",
+        reaction="⚡",
     )
 
 
@@ -175,7 +175,7 @@ async def test_on_processing_start_handles_missing_ids(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_success(monkeypatch):
-    """Successful processing should set thumbs-up reaction."""
+    """Successful processing should set the fork's completion reaction."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event()
@@ -185,13 +185,13 @@ async def test_on_processing_complete_success(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction="\U0001f44d",
+        reaction="✅",
     )
 
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_failure(monkeypatch):
-    """Failed processing should set thumbs-down reaction."""
+    """Failed processing should set the fork's attention reaction."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event()
@@ -201,7 +201,7 @@ async def test_on_processing_complete_failure(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction="\U0001f44e",
+        reaction="🤔",
     )
 
 
@@ -218,26 +218,18 @@ async def test_on_processing_complete_skipped_when_disabled(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_on_processing_complete_cancelled_clears_reaction(monkeypatch):
-    """Cancelled processing should clear the in-progress reaction.
-
-    Without this clear, the 👀 reaction lingers on the user's message
-    indefinitely (until another agent run swaps it for 👍/👎). On a
-    ``/stop`` that ends a session, that reaction never gets cleaned up.
-    """
+async def test_on_processing_complete_cancelled_sets_attention_reaction(monkeypatch):
+    """Cancelled processing should use the fork's attention reaction."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event()
 
     await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
 
-    # set_message_reaction with reaction=None clears all reactions on the
-    # message (Bot API documented semantics; equivalent to Bot API 10.0's
-    # deleteMessageReaction but works on PTB 22.6 already).
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction=None,
+        reaction="🤔",
     )
 
 

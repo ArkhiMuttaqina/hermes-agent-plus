@@ -1949,6 +1949,7 @@ AUTHOR_MAP = {
     "biser@bisko.be": "bisko",  # PR #33784 salvage (re-pad reasoning_content on cross-provider fallback to require-side providers)
     # v0.15.0 additions
     "glen@workmanfirearms.com": "sgtworkman",
+    "daniel.laforce@argobox.com": "KeyArgo",  # check-attribution (Contributor Attribution Check run 27862317142)
     "jorge.fuenmayort@gmail.com": "jfuenmayor",
     "josh.dow@prepad.io": "joshuadow",  # PR #43004 salvage (desktop WS session rebind)
     "mordred@inaugust.com": "emonty",
